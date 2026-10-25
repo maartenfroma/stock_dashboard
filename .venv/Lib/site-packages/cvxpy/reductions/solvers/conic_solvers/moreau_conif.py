@@ -1,0 +1,382 @@
+"""
+Copyright 2025, the CVXPY Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+"""
+
+import numpy as np
+import scipy.sparse as sp
+
+import cvxpy.settings as s
+from cvxpy.constraints import SOC, ExpCone, PowCone3D, PowConeND, SvecPSD
+from cvxpy.reductions.solution import Solution, failure_solution
+from cvxpy.reductions.solvers import utilities
+from cvxpy.reductions.solvers.conic_solvers.conic_solver import ConicSolver
+from cvxpy.reductions.solvers.solver_inverse_data import SolverInverseData
+from cvxpy.utilities.citations import CITATION_DICT
+from cvxpy.utilities.psd_utils import TriangleKind
+
+
+def dims_to_solver_cones(cone_dims):
+    """Convert CVXPY cone dimensions to Moreau cone specification.
+
+    Parameters
+    ----------
+    cone_dims : ConeDims
+        CVXPY cone dimensions object
+
+    Returns
+    -------
+    moreau.Cones
+        Moreau cone specification
+    """
+    import moreau
+
+    # ConeDims.pnd is a list of per-cone alpha lists (each summing to
+    # 1).  CVXPY's PowConeND has dim2 = 1 by convention (single z[j]
+    # per cone), so each Moreau gen_power slot is (alphas, 1).
+    gen_power_params = [(list(alphas), 1) for alphas in cone_dims.pnd]
+
+    cones = moreau.Cones(
+        num_zero_cones=cone_dims.zero,
+        num_nonneg_cones=cone_dims.nonneg,
+        so_cone_dims=list(cone_dims.soc),
+        num_exp_cones=cone_dims.exp,
+        power_alphas=list(cone_dims.p3d),
+        gen_power_cone_params=gen_power_params,
+        psd_dims=list(cone_dims.psd),
+    )
+
+    return cones
+
+
+class MOREAU(ConicSolver):
+    """An interface for the Moreau GPU solver.
+
+    Moreau is a GPU-accelerated conic optimization solver based on the
+    Clarabel interior-point algorithm, designed for high-throughput batch solving.
+    """
+
+    # Solver capabilities
+    MIP_CAPABLE = False
+    BOUNDED_VARIABLES = False
+    DIR_CONE_KINDS = frozenset({'nonneg', 'soc', 'psd_triangle', 'exp', 'power', 'gen_power'})
+    SUPPORTED_CONSTRAINTS = ConicSolver.SUPPORTED_CONSTRAINTS + [
+        SOC, ExpCone, PowCone3D, PowConeND, SvecPSD,
+    ]
+    # Moreau's psd_triangle direct cone uses upper-triangle column-major
+    # ordering with sqrt(2) scaling on off-diagonals (as in CLARABEL).
+    PSD_TRIANGLE_KIND = TriangleKind.UPPER
+    PSD_SQRT2_SCALING = True
+
+    # Status messages from Moreau (based on solver/status.hpp)
+    SOLVED = "Solved"
+    PRIMAL_INFEASIBLE = "PrimalInfeasible"
+    DUAL_INFEASIBLE = "DualInfeasible"
+    ALMOST_SOLVED = "AlmostSolved"
+    ALMOST_PRIMAL_INFEASIBLE = "AlmostPrimalInfeasible"
+    ALMOST_DUAL_INFEASIBLE = "AlmostDualInfeasible"
+    MAX_ITERATIONS = "MaxIterations"
+    MAX_TIME = "MaxTime"
+    NUMERICAL_ERROR = "NumericalError"
+    INSUFFICIENT_PROGRESS = "InsufficientProgress"
+    ACCEPT_UNKNOWN = "accept_unknown"
+
+    STATUS_MAP = {
+        SOLVED: s.OPTIMAL,
+        PRIMAL_INFEASIBLE: s.INFEASIBLE,
+        DUAL_INFEASIBLE: s.UNBOUNDED,
+        ALMOST_SOLVED: s.OPTIMAL_INACCURATE,
+        ALMOST_PRIMAL_INFEASIBLE: s.INFEASIBLE_INACCURATE,
+        ALMOST_DUAL_INFEASIBLE: s.UNBOUNDED_INACCURATE,
+        MAX_ITERATIONS: s.USER_LIMIT,
+        MAX_TIME: s.USER_LIMIT,
+        NUMERICAL_ERROR: s.SOLVER_ERROR,
+        INSUFFICIENT_PROGRESS: s.SOLVER_ERROR,
+    }
+
+    # Order of exponential cone arguments for solver
+    EXP_CONE_ORDER = [0, 1, 2]
+
+    def name(self):
+        """The name of the solver."""
+        return "MOREAU"
+
+    def import_solver(self) -> None:
+        """Imports the solver."""
+        import moreau  # noqa F401
+
+    def supports_quad_obj(self) -> bool:
+        """Moreau supports quadratic objective with conic constraints."""
+        return True
+
+    def apply(self, problem):
+        """Forward extracted cones alongside the usual slack-side solver data."""
+        data, inv_data = super().apply(problem)
+        data['dir_cones'] = problem.dir_cones
+        return data, inv_data
+
+    def invert(self, solution, inverse_data):
+        """Returns the solution to the original problem given the inverse_data."""
+        attr = {}
+        status_map = self.STATUS_MAP.copy()
+
+        # Handle accept_unknown option
+        if (
+            isinstance(inverse_data, SolverInverseData)
+            and MOREAU.ACCEPT_UNKNOWN in inverse_data.solver_options
+            and solution.x is not None
+            and solution.z is not None
+        ):
+            status_map["InsufficientProgress"] = s.OPTIMAL_INACCURATE
+
+        status = status_map.get(str(solution.status), s.SOLVER_ERROR)
+        attr[s.SOLVE_TIME] = solution.solve_time
+        attr[s.SETUP_TIME] = solution.setup_time
+        attr[s.NUM_ITERS] = solution.iterations
+
+        if status in s.SOLUTION_PRESENT:
+            primal_val = solution.obj_val
+            opt_val = primal_val + inverse_data[s.OFFSET]
+            primal_vars = {inverse_data[self.VAR_ID]: solution.x}
+            eq_dual_vars = utilities.get_dual_values(
+                solution.z[: inverse_data[ConicSolver.DIMS].zero],
+                utilities.extract_dual_value,
+                inverse_data[self.EQ_CONSTR],
+            )
+            ineq_dual_vars = utilities.get_dual_values(
+                solution.z[inverse_data[ConicSolver.DIMS].zero :],
+                utilities.extract_dual_value,
+                inverse_data[self.NEQ_CONSTR],
+            )
+            dual_vars = {}
+            dual_vars.update(eq_dual_vars)
+            dual_vars.update(ineq_dual_vars)
+            # Direct cone duals are keyed by their original constraint IDs.
+            dual_vars.update(solution.dir_cone_duals)
+            return Solution(status, opt_val, primal_vars, dual_vars, attr)
+        else:
+            return failure_solution(status, attr)
+
+    @staticmethod
+    def handle_options(verbose: bool, solver_opts: dict):
+        """Handle user-specified solver options.
+
+        Parameters
+        ----------
+        verbose : bool
+            Enable verbose output
+        solver_opts : dict
+            Solver-specific options
+
+        Returns
+        -------
+        tuple
+            (settings, processed_opts) where settings is moreau.Settings and
+            processed_opts contains accept_unknown
+        """
+        import moreau
+
+        solver_opts = solver_opts.copy() if solver_opts else {}
+
+        # Extract cvxpy-specific options
+        processed_opts = {}
+        processed_opts["accept_unknown"] = solver_opts.pop("accept_unknown", False)
+
+        # Extract device (now part of Settings)
+        device = solver_opts.pop("device", "auto")
+
+        # Remove use_quad_obj (handled by reduction chain, not solver)
+        solver_opts.pop("use_quad_obj", None)
+
+        # Create Settings with device and verbose
+        settings = moreau.Settings(
+            device=device,
+            verbose=verbose,
+        )
+
+        # Handle ipm_settings: accept dict or moreau.IPMSettings
+        ipm_settings = solver_opts.pop("ipm_settings", None)
+        if ipm_settings is not None:
+            if isinstance(ipm_settings, dict):
+                ipm_settings = moreau.IPMSettings(**ipm_settings)
+            settings.ipm_settings = ipm_settings
+
+        # Apply all remaining options directly to moreau.Settings
+        for opt, value in solver_opts.items():
+            try:
+                setattr(settings, opt, value)
+            except AttributeError as e:
+                raise TypeError(f"Moreau: unrecognized solver setting '{opt}'.") from e
+            except TypeError as e:
+                raise TypeError(f"Moreau: incorrect type for setting '{opt}'.") from e
+
+        return settings, processed_opts
+
+    def solve_via_data(self, data, warm_start: bool, verbose: bool, solver_opts, solver_cache=None):
+        """Returns the result of the call to the solver.
+
+        Parameters
+        ----------
+        data : dict
+            Data generated via an apply call.
+        warm_start : bool
+            Whether to initialize Moreau from the previous solution.
+        verbose : bool
+            Control the verbosity.
+        solver_opts : dict
+            Moreau-specific solver options.
+        solver_cache : dict, optional
+            Cache for compiled solvers and warm-start points in Moreau's coordinates.
+
+        Returns
+        -------
+        Solution object from Moreau solver.
+        """
+        import moreau
+
+        A = data[s.A]
+        b = data[s.B]
+        q = data[s.C]
+
+        if s.P in data:
+            P = data[s.P]
+        else:
+            nvars = q.size
+            # Create empty sparse matrix with proper structure
+            P = sp.csr_array((nvars, nvars))
+
+        # Convert to CSR format
+        P = P.tocsr()
+        A = A.tocsr()
+
+        # Convert cone dimensions
+        cones = dims_to_solver_cones(data[ConicSolver.DIMS])
+
+        # Forward extracted cones on subvectors of the primal variable.
+        dir_cones_meta = data['dir_cones']
+        cones.dir_cones = [moreau.DirectConeSpec(kind=c.kind, indices=c.indices, **c.extras)
+                           for c in dir_cones_meta]
+
+        # Moreau's direct PSD variables are scaled svec entries. CVXPY's
+        # symmetric variables store unscaled entries, so use x_solver = D x.
+        scale = np.ones(q.size)
+        for cone in dir_cones_meta:
+            if cone.kind == 'psd_triangle':
+                n = cone.extras['psd_k']
+                j = np.arange(n)
+                indices = np.asarray(cone.indices)
+                scale[indices] = np.sqrt(2)
+                scale[indices[j * (j + 3) // 2]] = 1
+        if np.any(scale != 1):
+            inverse_scale = sp.diags_array(1 / scale, format='csr')
+            P = inverse_scale @ P @ inverse_scale
+            A = A @ inverse_scale
+            q = q / scale
+
+        # Handle options (device is now part of Settings)
+        settings, processed_opts = self.handle_options(verbose, solver_opts or {})
+
+        settings.batch_size = 1
+        # Chordal decomposition also depends on the nonzero pattern of b.
+        b_sparsity = b != 0
+        structure = (
+            P.shape, A.shape, P.indptr.tobytes(), P.indices.tobytes(),
+            A.indptr.tobytes(), A.indices.tobytes(), b_sparsity.tobytes(),
+            cones.model_dump(), settings.model_dump(),
+        )
+        cached = None
+        if warm_start and solver_cache is not None:
+            cached = solver_cache.get(self.name())
+        if cached is None or cached["structure"] != structure:
+            solver = moreau.CompiledSolver(
+                n=q.size, m=b.size,
+                P_row_offsets=P.indptr, P_col_indices=P.indices,
+                A_row_offsets=A.indptr, A_col_indices=A.indices,
+                cones=cones, settings=settings.model_copy(deep=True),
+                b_sparsity_pattern=b_sparsity.tolist(),
+            )
+            cached = {"solver": solver, "structure": structure, "P": None, "A": None,
+                      "warm_start": None}
+        solver = cached["solver"]
+        if not (np.array_equal(P.data, cached["P"]) and np.array_equal(A.data, cached["A"])):
+            solver.setup(P.data, A.data)
+            cached["P"], cached["A"] = P.data.copy(), A.data.copy()
+        solution = solver.solve(q[None, :], b[None, :], warm_start=cached["warm_start"])[0]
+        info = solver.info  # Metadata is on solver.info after solve()
+
+        wrapped = MoreauSolution(solution, info)
+        if solver_cache is not None:
+            if wrapped.status in (self.SOLVED, self.ALMOST_SOLVED):
+                # Keep native coordinates, including scaled PSD entries and
+                # direct-cone duals. to_warm_start() copies all four vectors.
+                cached["warm_start"] = solution.to_warm_start()
+                solver_cache[self.name()] = cached
+            else:
+                solver_cache.pop(self.name(), None)
+        if solution.x is not None:
+            wrapped.x = solution.x / scale
+        if dir_cones_meta and solution.z_x is not None:
+            # A single constraint may emit multiple DirectConeSpec entries
+            # (multi-cone SOC / SvecPSD). Moreau returns z_x in spec order,
+            # already unequilibrated, with the same svec convention as the
+            # removed SvecPSD rows.
+            partials: dict[int, list] = {}
+            offset = 0
+            for cone in dir_cones_meta:
+                end = offset + len(cone.indices)
+                partials.setdefault(cone.constr_id, []).append(solution.z_x[offset:end])
+                offset = end
+            wrapped.dir_cone_duals = {
+                cid: parts[0] if len(parts) == 1 else np.concatenate(parts)
+                for cid, parts in partials.items()
+            }
+        else:
+            wrapped.dir_cone_duals = {}
+        return wrapped
+
+    def cite(self, data):
+        """Returns bibtex citation for the solver.
+
+        Parameters
+        ----------
+        data : dict
+            Data generated via an apply call.
+
+        Returns
+        -------
+        str
+            BibTeX citation
+        """
+        return CITATION_DICT["MOREAU"]
+
+
+class MoreauSolution:
+    """Wrapper combining solution vectors with solver metadata.
+
+    Moreau separates solution vectors (x, s, z from solver.solve()) from
+    metadata (status, timing, iterations from solver.info). This wrapper
+    combines them into a single object for use in invert().
+    """
+
+    def __init__(self, sol, info):
+        self.x = sol.x
+        self.s = sol.s
+        self.z = sol.z
+        self.status = info.status[0].name
+        self.iterations = np.asarray(info.iterations).item()
+        self.solve_time = info.solve_time
+        self.setup_time = info.setup_time
+        self.obj_val = np.asarray(info.obj_val).item()
