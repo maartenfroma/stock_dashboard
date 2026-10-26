@@ -355,8 +355,7 @@ elif menu_choice == "📊 Portfolio Management":
             unsafe_allow_html=True,
         )
         st.write(
-            "Bereken automatisch de ideale gewichten voor je gekozen aandelen op"
-            " basis van historische data."
+            "Compute optimal portfolio weights."
         )
 
         if st.button("Optimize Portfolio Weights"):
@@ -458,7 +457,7 @@ elif menu_choice == "Database Commitment":
                 portfolio_name=portfolio_name_input
             )
             st.success(
-                f"Portefeuille '{portfolio_name_input}' succesvol opgeslagen als snapshot!"
+                f"Portefeuille '{portfolio_name_input}' successfull saved as snapshot!"
             )
         else:
             st.warning("No active portfolio found in session.")
@@ -535,11 +534,11 @@ elif menu_choice == "AI Portfolio Analyst":
 
     st.markdown('<div class="fintech-card">', unsafe_allow_html=True)
     st.markdown(
-        '<div class="card-title">💬 Vraag het de AI Portefeuille Expert</div>',
+        '<div class="card-title">💬 Ask the AI Portefolio Expert</div>',
         unsafe_allow_html=True,
     )
     st.write(
-        "De AI analyseert direct jouw actuele portefeuille via de officiële"
+        "The AI analyses your portfolio directly"
         " Groq-client."
     )
 
@@ -550,7 +549,7 @@ elif menu_choice == "AI Portfolio Analyst":
             portfolio_context = (
                 str(st.session_state.get("portfolio_holdings", {}))
                 if "portfolio_holdings" in st.session_state
-                else "Geen portefeuille geladen."
+                else "No portfolio loaded."
             )
 
             user_question = st.text_input(
