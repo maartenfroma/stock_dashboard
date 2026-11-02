@@ -181,32 +181,54 @@ class Portfolio:
 
     def optimize_portfolio(self, tickers, start, end):
         try:
-            close_data = {}
-            for ticker in tickers:
-                # Download per aandeel apart om multi-index en versieproblemen te voorkomen
-                df_t = yf.download(ticker, start=start, end=end, progress=False)
-                if not df_t.empty and "Close" in df_t.columns:
-                    s = df_t["Close"]
-                    # Zorg dat het altijd een schone Series is
-                    if isinstance(s, pd.DataFrame):
-                        s = s.iloc[:, 0]
-                    close_data[ticker] = s
-
-            # Samenvoegen tot één DataFrame en ontbrekende dagen weglaten
-            data = pd.DataFrame(close_data).dropna()
-
-            if data.empty or data.shape[1] < 2:
+            #Check if list is empty or has less than 2 tickers
+            if not tickers or len(tickers) < 2:
+                print("At least two tickers are required for optimization.")
                 return None, None
 
+            # Fetch historical data for the given tickers and date range
+            df = yf.download(tickers, start=start, end=end, auto_adjust=True)
+
+
+
+            # Check if the DataFrame is empty or does not contain the required columns
+            if df.empty:
+                print("No data fetched for the given tickers and date range.")
+                return None, None
+            
+            if 'Close' in df.columns:
+                data=df['Close']
+            elif 'Adj Close' in df.columns:
+                data=df['Adj Close']
+            elif 'adjclose' in df.columns:
+                data=df['adjclose'] 
+            else:
+                print("Data does not contain 'Close' or 'Adj Close' columns.")
+                return None, None
+            
+            # Check if the data is a Series (single ticker) or DataFrame (multiple tickers)
+            if isinstance(data, pd.Series):
+                print("Data contains only one ticker. At least two tickers are required for optimization.")
+                return None, None
+
+            # Drop rows where all values are NaN
+            data = data.dropna() 
+            
+            if data.empty or data.shape[1] < 2:
+                print("Not enough valid data for optimization after dropping NaN values.")
+                return None, None
+            
             mu = expected_returns.mean_historical_return(data)
             S = risk_models.sample_cov(data)
 
-            ef = EfficientFrontier(mu, S)
-            ef.max_sharpe(risk_free_rate=0.03)
-            cleaned_weights = ef.clean_weights()
-            performance = ef.portfolio_performance(risk_free_rate=0.03)
+            # Optimize the portfolio for maximum Sharpe ratio with weight bounds
+            ef = EfficientFrontier(mu, S, weight_bounds=(0, 0.35))
+            weights = ef.max_sharpe(risk_free_rate=0.03)
+            cleaned_weights = ef.clean_weights(cutoff=1e-4)
+            performance = ef.portfolio_performance(risk_free_rate=0.03, verbose=False)
 
             return cleaned_weights, performance
+        
         except Exception as e:
-            print(f"Fout bij portfolio optimalisatie: {e}")
+            print(f"Error optimizing portfolio: {e}")
             return None, None

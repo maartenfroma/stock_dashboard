@@ -243,7 +243,9 @@ elif menu_choice == "📊 Portfolio Management":
     with col_add_t:
         new_ticker = st.text_input("Ticker Symbol", value="NVDA").upper()
     with col_add_q:
-        new_shares = st.number_input("Position n", min_value=1, value=10, step=1)
+        new_shares = st.number_input(
+            "Position n", min_value=1, value=10, step=1
+        )
     with col_add_btn:
         st.write("")
         st.write("")
@@ -251,6 +253,7 @@ elif menu_choice == "📊 Portfolio Management":
             if new_ticker:
                 st.session_state.portfolio_holdings[new_ticker] = new_shares
                 st.success(f"Added: {new_shares}x {new_ticker} to portfolio!")
+                st.rerun()
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -299,13 +302,14 @@ elif menu_choice == "📊 Portfolio Management":
             value=f"${total_portfolio_value:,.2f}",
         )
 
+        # Aangepast naar width="stretch" (vervangt use_container_width=True)
         st.dataframe(
             df_portfolio.style.format({
                 "Actual Price ($)": "${:,.2f}",
                 "Position Value ($)": "${:,.2f}",
                 "Weight (%)": "{:.1f}%",
             }),
-            use_container_width=True,
+            width="stretch",
         )
 
         st.markdown("---")
@@ -352,9 +356,14 @@ elif menu_choice == "📊 Portfolio Management":
                             value=f"{exp_return*100:.2f}%",
                         )
                     with op2:
-                        st.metric(label="Optimal Volatility", value=f"{volatility*100:.2f}%")
+                        st.metric(
+                            label="Optimal Volatility",
+                            value=f"{volatility*100:.2f}%",
+                        )
                     with op3:
-                        st.metric(label="Optimized Sharpe Ratio", value=f"{sharpe:.2f}")
+                        st.metric(
+                            label="Optimized Sharpe Ratio", value=f"{sharpe:.2f}"
+                        )
 
                     st.markdown("#### 💡 Recommended Optimal Weights:")
                     df_weights = pd.DataFrame(
@@ -364,11 +373,13 @@ elif menu_choice == "📊 Portfolio Management":
                     df_weights["Recommended Weight (%)"] = (
                         df_weights["Recommended Weight"] * 100
                     )
+
+                    # Aangepast naar width="stretch" (vervangt use_container_width=True)
                     st.dataframe(
                         df_weights[["Ticker", "Recommended Weight (%)"]].style.format({
                             "Recommended Weight (%)": "{:.1f}%"
                         }),
-                        use_container_width=True,
+                        width="stretch",
                     )
                 else:
                     st.error(
